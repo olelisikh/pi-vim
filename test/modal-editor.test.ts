@@ -9908,6 +9908,11 @@ describe("visual mode — footer label", () => {
 
     assert.ok(wrappedLines[1]?.includes("\x1b[7mone\x1b[27m"));
     assert.equal(wrappedLines[2]?.includes("\x1b[7m"), false);
+
+    const acrossWrap = createEditorWithSpy("one two three four");
+    sendKeys(acrossWrap.editor, ["v", ...Array.from({ length: 8 }, () => "l")]);
+    const acrossWrapLines = acrossWrap.editor.render(12);
+    assert.ok(acrossWrapLines[2]?.includes("\x1b[7mt\x1b[0m"));
   });
 });
 

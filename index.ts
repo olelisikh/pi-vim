@@ -10,7 +10,6 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
-import { wordWrapLine } from "@earendil-works/pi-tui/dist/components/editor.js";
 import {
   ClipboardMirror,
   type ClipboardReadFn,
@@ -140,6 +139,103 @@ type RenderLayoutLine = {
   startIndex: number;
   text: string;
 };
+
+type WrappedLineChunk = Pick<RenderLayoutLine, "startIndex" | "text">;
+
+const renderLayoutSegmenter = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
+const PASTE_MARKER_SEGMENT = /^\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]$/;
+
+function isPasteMarkerSegment(segment: string): boolean {
+  return segment.length >= 10 && PASTE_MARKER_SEGMENT.test(segment);
+}
+
+/**
+ * pi-tui's offset-preserving wordWrapLine helper is internal and unavailable
+ * from Pi's bundled runtime. Keep the equivalent layout logic here because
+ * visual-selection painting needs source offsets that wrapTextWithAnsi omits.
+ */
+function wrapLineForRenderLayout(
+  line: string,
+  maxWidth: number,
+  preSegmented?: Intl.SegmentData[],
+): WrappedLineChunk[] {
+  if (!line || maxWidth <= 0) return [{ text: "", startIndex: 0 }];
+
+  if (visibleWidth(line) <= maxWidth) {
+    return [{ text: line, startIndex: 0 }];
+  }
+
+  const chunks: WrappedLineChunk[] = [];
+  const segments = preSegmented ?? [...renderLayoutSegmenter.segment(line)];
+  let currentWidth = 0;
+  let chunkStart = 0;
+  let wrapOpportunityIndex = -1;
+  let wrapOpportunityWidth = 0;
+
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (!segment) continue;
+    const grapheme = segment.segment;
+    const graphemeWidth = visibleWidth(grapheme);
+    const charIndex = segment.index;
+    const isWhitespace = !isPasteMarkerSegment(grapheme) && /\s/.test(grapheme);
+
+    if (currentWidth + graphemeWidth > maxWidth) {
+      if (
+        wrapOpportunityIndex >= 0 &&
+        currentWidth - wrapOpportunityWidth + graphemeWidth <= maxWidth
+      ) {
+        chunks.push({
+          text: line.slice(chunkStart, wrapOpportunityIndex),
+          startIndex: chunkStart,
+        });
+        chunkStart = wrapOpportunityIndex;
+        currentWidth -= wrapOpportunityWidth;
+      } else if (chunkStart < charIndex) {
+        chunks.push({
+          text: line.slice(chunkStart, charIndex),
+          startIndex: chunkStart,
+        });
+        chunkStart = charIndex;
+        currentWidth = 0;
+      }
+      wrapOpportunityIndex = -1;
+    }
+
+    if (graphemeWidth > maxWidth) {
+      const subChunks = wrapLineForRenderLayout(grapheme, maxWidth);
+      for (const subChunk of subChunks.slice(0, -1)) {
+        chunks.push({
+          text: subChunk.text,
+          startIndex: charIndex + subChunk.startIndex,
+        });
+      }
+      const lastSubChunk = subChunks[subChunks.length - 1];
+      if (lastSubChunk) {
+        chunkStart = charIndex + lastSubChunk.startIndex;
+        currentWidth = visibleWidth(lastSubChunk.text);
+      }
+      wrapOpportunityIndex = -1;
+      continue;
+    }
+
+    currentWidth += graphemeWidth;
+    const next = segments[i + 1];
+    if (
+      isWhitespace &&
+      next &&
+      (isPasteMarkerSegment(next.segment) || !/\s/.test(next.segment))
+    ) {
+      wrapOpportunityIndex = next.index;
+      wrapOpportunityWidth = currentWidth;
+    }
+  }
+
+  chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart });
+  return chunks;
+}
 
 function getRuntimeInternals<T>(value: unknown): T {
   // SAFETY: callers guard optional runtime internals before use.
@@ -1516,7 +1612,7 @@ export class ModalEditor extends CustomEditor {
       }
 
       if (this.pendingEscWhileAcceptingBracketedPasteInNormalMode) {
-        data = "\x1b" + data;
+        data = `\x1b${data}`;
         this.pendingEscWhileAcceptingBracketedPasteInNormalMode = false;
       } else if (isEscapeLikeInput(data)) {
         this.pendingEscWhileAcceptingBracketedPasteInNormalMode = true;
@@ -4391,7 +4487,11 @@ export class ModalEditor extends CustomEditor {
       const chunks =
         visibleWidth(line) <= layoutWidth
           ? [{ text: line, startIndex: 0 }]
-          : wordWrapLine(line, layoutWidth, editor.segment(line, "grapheme"));
+          : wrapLineForRenderLayout(
+              line,
+              layoutWidth,
+              editor.segment(line, "grapheme"),
+            );
       for (const chunk of chunks) {
         layoutLines.push({
           logicalLine,
